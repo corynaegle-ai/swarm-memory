@@ -4,13 +4,28 @@ Implements duplicate detection, change detection, and priority scoring
 for memory extraction to reduce token costs by 50%.
 """
 
-import json
 import hashlib
+import json
+import os
 import re
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import numpy as np
+
+# Constants for configuration
+DEFAULT_MIN_TOKENS = 500
+DEFAULT_SIMILARITY_THRESHOLD = 0.85
+DEFAULT_CHANGE_THRESHOLD = 0.3
+DUPLICATE_THRESHOLD = 0.95
+HIGH_PRIORITY_THRESHOLD = 0.7
+MAX_BATCH_SIZE = 10
+BATCH_INTERVAL_MINUTES = 60
+EMBEDDING_TIMEOUT = 5
+API_TIMEOUT = 10
+MAX_CONTENT_LENGTH = 500
+STATE_PERSISTENCE_FILE = "/tmp/memory_filter_state.json"
+DEFAULT_EMBEDDING_ENDPOINT = "http://192.168.85.158:11434/api/embeddings"
 
 
 @dataclass
@@ -26,12 +41,25 @@ class FilterResult:
 
 
 class EmbeddingCache:
-    """Simple in-memory cache for embeddings"""
+    """
+    Simple in-memory cache for embeddings.
+    Uses singleton pattern to share cache across all detector instances.
+    """
+    
+    _instance = None
+    _initialized = False
+    
+    def __new__(cls, max_size: int = 1000):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
     
     def __init__(self, max_size: int = 1000):
-        self.cache = {}
-        self.max_size = max_size
-        self.access_times = {}
+        if not EmbeddingCache._initialized:
+            self.cache = {}
+            self.max_size = max_size
+            self.access_times = {}
+            EmbeddingCache._initialized = True
     
     def get(self, text: str) -> Optional[List[float]]:
         key = hashlib.md5(text.encode()).hexdigest()
@@ -93,7 +121,7 @@ class DuplicateDetector:
                 response = requests.post(
                     self.embedding_endpoint,
                     json={"model": "nomic-embed-text", "prompt": text},
-                    timeout=5
+                    timeout=EMBEDDING_TIMEOUT
                 )
                 if response.ok:
                     embedding = response.json().get("embedding")
@@ -133,14 +161,20 @@ class DuplicateDetector:
         """
         similar = []
         
+        # Get API key from environment
+        api_key = os.getenv("SWARM_MEMORY_API_KEY", "")
+        if not api_key:
+            print("Warning: SWARM_MEMORY_API_KEY not set")
+            return similar
+        
         # Query recent memories from API
         try:
             import requests
             response = requests.post(
                 f"{memory_api_url}/memory/query",
-                headers={"X-API-Key": "3af7aebc2f1714f378580d68eb569a12"},
+                headers={"X-API-Key": api_key},
                 json={"query": new_content, "limit": 5, "agent_id": agent_id},
-                timeout=10
+                timeout=API_TIMEOUT
             )
             
             if response.ok:
@@ -166,9 +200,9 @@ class DuplicateDetector:
         """
         similar = self.find_duplicates(content, agent_id)
         
-        # Consider it a duplicate if any match is > 95% similar
+        # Consider it a duplicate if any match is above duplicate threshold
         for mem in similar:
-            if mem["similarity"] >= 0.95:
+            if mem["similarity"] >= DUPLICATE_THRESHOLD:
                 return True, similar
         
         # Consider it near-duplicate if avg similarity > threshold
@@ -183,20 +217,42 @@ class DuplicateDetector:
 class ChangeDetector:
     """
     Detects if conversation contains new information worth extracting.
+    Uses content hashing and persistence to track changes across restarts.
     """
     
     def __init__(self, 
-                 min_tokens: int = 500,
-                 significant_change_threshold: float = 0.3):
+                 min_tokens: int = DEFAULT_MIN_TOKENS,
+                 significant_change_threshold: float = DEFAULT_CHANGE_THRESHOLD,
+                 state_file: str = STATE_PERSISTENCE_FILE):
         self.min_tokens = min_tokens
         self.change_threshold = significant_change_threshold
-        self.last_states = {}  # agent_id -> last_state_hash
+        self.state_file = state_file
+        self.last_states = {}  # agent_id -> {hash, content_preview, timestamp}
+        self._load_state()
+    
+    def _load_state(self):
+        """Load persisted state from disk"""
+        try:
+            if os.path.exists(self.state_file):
+                with open(self.state_file, 'r') as f:
+                    self.last_states = json.load(f)
+        except Exception as e:
+            print(f"Warning: Could not load state: {e}")
+    
+    def _save_state(self):
+        """Persist state to disk"""
+        try:
+            with open(self.state_file, 'w') as f:
+                json.dump(self.last_states, f)
+        except Exception as e:
+            print(f"Warning: Could not save state: {e}")
     
     def has_significant_changes(self, 
                                conversation_turns: List[Dict],
                                agent_id: str) -> Tuple[bool, str]:
         """
         Determine if conversation has significant new information.
+        Compares against previous extraction content for real change detection.
         Returns (has_changes, reason).
         """
         # Check minimum size
@@ -204,47 +260,65 @@ class ChangeDetector:
         if total_tokens < self.min_tokens:
             return False, f"Too small ({total_tokens} tokens < {self.min_tokens} min)"
         
-        # Compute state hash
-        state_hash = self._compute_state_hash(conversation_turns)
+        # Compute current state
+        current_content = " ".join(t.get("content", "") for t in conversation_turns[-5:])  # Last 5 turns
+        current_hash = hashlib.md5(current_content.encode()).hexdigest()
         
         # Check if state changed
-        last_hash = self.last_states.get(agent_id)
-        if last_hash == state_hash:
+        last_state = self.last_states.get(agent_id)
+        if last_state and last_state.get("hash") == current_hash:
             return False, "No state change from last extraction"
         
-        # Check for content changes
-        content_change = self._measure_content_change(
-            conversation_turns, agent_id
-        )
+        # Check for actual content changes vs previous extraction
+        content_change = self._measure_content_change(current_content, agent_id)
         
         if content_change < self.change_threshold:
             return False, f"Content change below threshold ({content_change:.2f} < {self.change_threshold})"
         
-        # Update last state
-        self.last_states[agent_id] = state_hash
+        # Update last state with content preview for future comparison
+        self.last_states[agent_id] = {
+            "hash": current_hash,
+            "content_preview": current_content[:500],  # Store preview for comparison
+            "timestamp": datetime.now().isoformat(),
+            "word_count": len(set(current_content.lower().split()))
+        }
+        self._save_state()
         
         return True, f"Significant change detected ({content_change:.2f})"
     
     def _compute_state_hash(self, turns: List[Dict]) -> str:
         """Compute hash of conversation state"""
-        content = " ".join(t.get("content", "") for t in turns[-3:])  # Last 3 turns
+        content = " ".join(t.get("content", "") for t in turns[-5:])  # Last 5 turns
         return hashlib.md5(content.encode()).hexdigest()
     
-    def _measure_content_change(self, 
-                               turns: List[Dict], 
-                               agent_id: str) -> float:
-        """Measure how much content changed vs last extraction"""
-        # Simple heuristic: ratio of new unique words
-        current_text = " ".join(t.get("content", "") for t in turns)
-        current_words = set(current_text.lower().split())
+    def _measure_content_change(self, current_content: str, agent_id: str) -> float:
+        """
+        Measure how much content changed vs last extraction.
+        Returns 0.0-1.0 where 1.0 = completely different, 0.0 = identical.
+        """
+        last_state = self.last_states.get(agent_id)
+        if not last_state or "content_preview" not in last_state:
+            # No previous state - assume this is new content
+            return 1.0
         
-        # Ideally we'd compare to last extracted content
-        # For now, use token count as proxy for content volume
-        total_tokens = sum(t.get("tokens", 0) for t in turns)
+        # Compare word sets
+        current_words = set(current_content.lower().split())
+        previous_words = set(last_state["content_preview"].lower().split())
         
-        # Normalize: more tokens = more change potential
-        # Scale between 0 and 1 based on token count
-        return min(total_tokens / 2000, 1.0)
+        if not previous_words:
+            return 1.0
+        
+        # Calculate Jaccard distance (1 - similarity)
+        intersection = current_words & previous_words
+        union = current_words | previous_words
+        
+        if not union:
+            return 0.0
+        
+        similarity = len(intersection) / len(union)
+        change_score = 1.0 - similarity
+        
+        return change_score
 
 
 class PriorityScorer:
@@ -282,22 +356,33 @@ class PriorityScorer:
         """
         Score conversation priority.
         Returns (score, category, reason).
+        Uses word boundary matching to avoid false positives.
         """
         text_lower = conversation_text.lower()
         
-        # Check for high-priority keywords
+        # Check for high-priority keywords with word boundaries
+        # Sort by keyword length (longest first) to prefer specific matches
+        all_matches = []
         for category, keywords in self.KEYWORDS.items():
             for keyword in keywords:
-                if keyword in text_lower:
-                    score = self.PRIORITIES.get(category, 0.5)
-                    return score, category, f"Detected '{keyword}' -> {category}"
+                # Use word boundary regex to avoid partial matches
+                pattern = r'\b' + re.escape(keyword) + r'\b'
+                if re.search(pattern, text_lower):
+                    all_matches.append((category, keyword, len(keyword)))
+        
+        if all_matches:
+            # Prefer longest keyword match (more specific)
+            all_matches.sort(key=lambda x: x[2], reverse=True)
+            category, keyword, _ = all_matches[0]
+            score = self.PRIORITIES.get(category, 0.5)
+            return score, category, f"Detected '{keyword}' -> {category}"
         
         # Default: medium-low priority
         return 0.5, "general", "No specific indicators, general priority"
     
     def should_extract_immediately(self, score: float) -> bool:
         """Determine if extraction should happen immediately vs batched"""
-        return score >= 0.7  # High priority = immediate
+        return score >= HIGH_PRIORITY_THRESHOLD  # High priority = immediate
 
 
 class BatchProcessor:
@@ -305,8 +390,9 @@ class BatchProcessor:
     Batches low-priority extractions for hourly processing.
     """
     
-    def __init__(self, batch_interval_minutes: int = 60):
+    def __init__(self, batch_interval_minutes: int = BATCH_INTERVAL_MINUTES, max_batch_size: int = MAX_BATCH_SIZE):
         self.batch_interval = timedelta(minutes=batch_interval_minutes)
+        self.max_batch_size = max_batch_size
         self.batched_items = []
         self.last_process_time = datetime.now()
     
@@ -317,13 +403,13 @@ class BatchProcessor:
             "batched_at": datetime.now().isoformat()
         })
         
-        # Check if it's time to process
+        # Check if it's time to process based on interval
         time_since_last = datetime.now() - self.last_process_time
         if time_since_last >= self.batch_interval:
             return True
         
-        # Process if batch is getting large
-        if len(self.batched_items) >= 10:
+        # Process if batch has reached max size
+        if len(self.batched_items) >= self.max_batch_size:
             return True
         
         return False
@@ -338,7 +424,7 @@ class BatchProcessor:
     def should_process(self) -> bool:
         """Check if it's time to process batched items"""
         time_since_last = datetime.now() - self.last_process_time
-        return time_since_last >= self.batch_interval or len(self.batched_items) >= 10
+        return time_since_last >= self.batch_interval or len(self.batched_items) >= self.max_batch_size
 
 
 class SmartFilter:
@@ -348,9 +434,9 @@ class SmartFilter:
     """
     
     def __init__(self,
-                 embedding_endpoint: str = "http://192.168.85.158:11434/api/embeddings",
-                 similarity_threshold: float = 0.85,
-                 min_tokens: int = 500):
+                 embedding_endpoint: str = DEFAULT_EMBEDDING_ENDPOINT,
+                 similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+                 min_tokens: int = DEFAULT_MIN_TOKENS):
         self.duplicate_detector = DuplicateDetector(
             embedding_endpoint=embedding_endpoint,
             similarity_threshold=similarity_threshold
@@ -411,7 +497,7 @@ class SmartFilter:
         # 4. Determine extraction strategy
         context_hash = self.change_detector._compute_state_hash(conversation_turns)
         
-        if priority >= 0.7:
+        if priority >= HIGH_PRIORITY_THRESHOLD:
             # High priority: extract immediately
             return FilterResult(
                 should_extract=True,
@@ -453,7 +539,7 @@ class SmartFilter:
 def should_extract_memory(
     conversation_turns: List[Dict],
     agent_id: str,
-    embedding_endpoint: str = "http://192.168.85.158:11434/api/embeddings"
+    embedding_endpoint: str = DEFAULT_EMBEDDING_ENDPOINT
 ) -> bool:
     """
     Quick check if memory extraction should happen.

@@ -3,13 +3,22 @@ Batch Processing Service for Low-Priority Memory Extractions
 Processes batched extractions on an hourly schedule.
 """
 
-import json
 import asyncio
+import json
+import logging
+import os
 from datetime import datetime
 from typing import List, Dict
 import aiohttp
 
-from memory_filter import SmartFilter, FilterResult
+from memory_filter import SmartFilter, FilterResult, MAX_CONTENT_LENGTH, BATCH_INTERVAL_MINUTES, MAX_BATCH_SIZE
+
+# Configure structured logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
 class BatchExtractionService:
@@ -20,11 +29,15 @@ class BatchExtractionService:
     
     def __init__(self,
                  memory_api_url: str = "https://memory.swarmfactory.io",
-                 api_key: str = "3af7aebc2f1714f378580d68eb569a12",
-                 batch_interval_minutes: int = 60,
-                 max_batch_size: int = 10):
+                 api_key: str = None,
+                 batch_interval_minutes: int = BATCH_INTERVAL_MINUTES,
+                 max_batch_size: int = MAX_BATCH_SIZE):
         self.memory_api_url = memory_api_url
-        self.api_key = api_key
+        # Get API key from environment if not provided
+        self.api_key = api_key or os.getenv("SWARM_MEMORY_API_KEY", "")
+        if not self.api_key:
+            logger.warning("SWARM_MEMORY_API_KEY not set - API calls will fail")
+        
         self.batch_interval = batch_interval_minutes
         self.max_batch_size = max_batch_size
         self.filter = SmartFilter()
@@ -33,9 +46,9 @@ class BatchExtractionService:
     async def start(self):
         """Start the batch processing service"""
         self.running = True
-        print(f"[{datetime.now()}] Batch extraction service started")
-        print(f"  - Interval: {self.batch_interval} minutes")
-        print(f"  - Max batch size: {self.max_batch_size}")
+        logger.info("Batch extraction service started")
+        logger.info(f"  - Interval: {self.batch_interval} minutes")
+        logger.info(f"  - Max batch size: {self.max_batch_size}")
         
         while self.running:
             try:
@@ -47,7 +60,7 @@ class BatchExtractionService:
                 await asyncio.sleep(60)
                 
             except Exception as e:
-                print(f"[{datetime.now()}] Error in batch service: {e}")
+                logger.error(f"Error in batch service: {e}", exc_info=True)
                 await asyncio.sleep(60)
     
     async def _process_batch(self):
@@ -57,10 +70,10 @@ class BatchExtractionService:
         if not batch:
             return
         
-        print(f"[{datetime.now()}] Processing batch of {len(batch)} items")
+        logger.info(f"Processing batch of {len(batch)} items")
         
         # Group by agent for efficiency
-        by_agent = {}
+        by_agent: Dict[str, List[Dict]] = {}
         for item in batch:
             agent_id = item.get("context", {}).get("agent_id", "unknown")
             if agent_id not in by_agent:
@@ -73,7 +86,7 @@ class BatchExtractionService:
     
     async def _process_agent_batch(self, agent_id: str, items: List[Dict]):
         """Process batched items for a single agent"""
-        print(f"  Processing {len(items)} items for {agent_id}")
+        logger.info(f"Processing {len(items)} items for {agent_id}")
         
         # Combine related extractions
         combined_content = self._combine_extractions(items)
@@ -96,7 +109,7 @@ class BatchExtractionService:
             ))
             
             # Extract key information
-            content = context.get("content", "")[:500]  # Truncate long content
+            content = context.get("content", "")[:MAX_CONTENT_LENGTH]  # Truncate long content
             priority = result.priority
             
             parts.append(f"[Priority {priority:.1f}] {content}")
@@ -105,6 +118,10 @@ class BatchExtractionService:
     
     async def _store_extraction(self, agent_id: str, content: str, metadata: Dict):
         """Store extraction to memory API"""
+        if not self.api_key:
+            logger.error("Cannot store extraction: API key not configured")
+            return
+        
         try:
             async with aiohttp.ClientSession() as session:
                 payload = {
@@ -121,39 +138,38 @@ class BatchExtractionService:
                     json=payload
                 ) as response:
                     if response.status == 200:
-                        print(f"    ✓ Stored batch for {agent_id}")
+                        logger.info(f"Stored batch for {agent_id}")
                     else:
-                        print(f"    ✗ Failed to store: {response.status}")
+                        logger.error(f"Failed to store: HTTP {response.status}")
                         
         except Exception as e:
-            print(f"    ✗ Error storing extraction: {e}")
+            logger.error(f"Error storing extraction: {e}", exc_info=True)
     
     def stop(self):
         """Stop the batch service"""
         self.running = False
+        logger.info("Batch service stopping...")
 
 
 # Standalone batch processor for command-line use
 def process_batch_now():
     """Process any pending batches immediately"""
-    import requests
-    
     filter = SmartFilter()
     batch = filter.process_batch()
     
     if not batch:
-        print("No batched items to process")
+        logger.info("No batched items to process")
         return
     
-    print(f"Processing {len(batch)} batched items...")
+    logger.info(f"Processing {len(batch)} batched items...")
     
     # Simple console output for now
     # In production, this would call the memory API
     for item in batch:
         context = item.get("context", {})
-        print(f"  - {context.get('agent_id', 'unknown')}: {context.get('content', '')[:100]}...")
+        logger.info(f"  - {context.get('agent_id', 'unknown')}: {context.get('content', '')[:100]}...")
     
-    print(f"\nProcessed {len(batch)} items")
+    logger.info(f"Processed {len(batch)} items")
 
 
 if __name__ == "__main__":
@@ -165,12 +181,12 @@ if __name__ == "__main__":
         process_batch_now()
     else:
         # Run as service
-        print("Starting batch extraction service...")
-        print("Use Ctrl+C to stop")
+        logger.info("Starting batch extraction service...")
+        logger.info("Use Ctrl+C to stop")
         
         service = BatchExtractionService()
         try:
             asyncio.run(service.start())
         except KeyboardInterrupt:
-            print("\nStopping service...")
+            logger.info("Stopping service...")
             service.stop()
