@@ -253,29 +253,43 @@ class AsyncOllamaClient:
                     except json.JSONDecodeError:
                         continue
     
-    async def embed(self, texts: List[str]) -> List[List[float]]:
-        """Get embeddings for texts"""
+    async def _embed_single(self, text: str) -> List[float]:
+        """Get embedding for a single text with retry logic"""
         session = await self._get_session()
-        embeddings = []
         
-        for text in texts:
-            payload = {
-                "model": EMBEDDING_MODEL,
-                "prompt": text[:8000]  # Truncate long texts
-            }
-            
-            async with session.post(
-                f"{self.endpoint}/api/embeddings",
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    embeddings.append(result.get("embedding", []))
-                else:
-                    embeddings.append([])
+        payload = {
+            "model": EMBEDDING_MODEL,
+            "prompt": text[:8000]  # Truncate long texts
+        }
         
-        return embeddings
+        async with session.post(
+            f"{self.endpoint}/api/embeddings",
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=30)
+        ) as response:
+            if response.status == 200:
+                result = await response.json()
+                return result.get("embedding", [])
+            else:
+                return []
+    
+    async def embed(self, texts: List[str]) -> List[List[float]]:
+        """Get embeddings for texts in parallel using asyncio.gather()"""
+        # Create tasks for parallel execution
+        tasks = [self._embed_single(text) for text in texts]
+        
+        # Execute all embedding calls in parallel
+        embeddings = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Handle any exceptions (return empty list for failures)
+        results = []
+        for emb in embeddings:
+            if isinstance(emb, Exception):
+                results.append([])
+            else:
+                results.append(emb)
+        
+        return results
 
 
 class Level1Summarizer:
