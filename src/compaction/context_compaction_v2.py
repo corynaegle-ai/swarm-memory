@@ -27,7 +27,7 @@ from typing import Dict, List, Optional, Tuple, Any, Union, Callable, AsyncItera
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from functools import lru_cache, wraps
+from functools import wraps
 import aiohttp
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -279,7 +279,7 @@ class AsyncOllamaClient:
 
 
 class Level1Summarizer:
-    """Level 1: 7B model - Parallel async summarization"""
+    """Level 1: 7B model - Parallel async summarization with caching"""
     
     def __init__(self, ollama_client: AsyncOllamaClient, prompts: Dict[str, str] = None):
         self.client = ollama_client
@@ -287,22 +287,64 @@ class Level1Summarizer:
         self.model = LEVEL1_MODEL
         self.max_output_tokens = LEVEL1_MAX_TOKENS
         self.semaphore = asyncio.Semaphore(MAX_CONCURRENT_L1)
+        # In-memory cache for summaries: (content_hash, role) -> TurnSummary
+        self._summary_cache: Dict[Tuple[str, str], TurnSummary] = {}
+        self._cache_hits = 0
+        self._cache_misses = 0
     
     def _content_hash(self, content: str) -> str:
         """Generate hash for caching"""
         return hashlib.md5(content.encode()).hexdigest()
     
-    @lru_cache(maxsize=1000)
-    def _cached_summary(self, content_hash: str, role: str) -> Optional[TurnSummary]:
-        """Cache check - returns None if not cached (actual cache is in-memory)"""
-        return None  # LRU cache decorator handles the actual caching
+    def _get_cached_summary(self, content_hash: str, role: str) -> Optional[TurnSummary]:
+        """Check if summary is cached"""
+        cache_key = (content_hash, role)
+        return self._summary_cache.get(cache_key)
+    
+    def _cache_summary(self, content_hash: str, role: str, summary: TurnSummary):
+        """Store summary in cache"""
+        cache_key = (content_hash, role)
+        # Create a copy with cache_hit flag set
+        cached_summary = TurnSummary(
+            turn_index=summary.turn_index,
+            role=summary.role,
+            original_content=summary.original_content,
+            summary=summary.summary,
+            original_tokens=summary.original_tokens,
+            summary_tokens=summary.summary_tokens,
+            timestamp=summary.timestamp,
+            cache_hit=True
+        )
+        self._summary_cache[cache_key] = cached_summary
+        
+        # Limit cache size to prevent memory issues
+        if len(self._summary_cache) > 1000:
+            # Remove oldest entries (simple FIFO)
+            oldest_key = next(iter(self._summary_cache))
+            del self._summary_cache[oldest_key]
+    
+    def get_cache_stats(self) -> Dict[str, int]:
+        """Get cache statistics"""
+        total = self._cache_hits + self._cache_misses
+        return {
+            "hits": self._cache_hits,
+            "misses": self._cache_misses,
+            "size": len(self._summary_cache),
+            "hit_rate": self._cache_hits / total if total > 0 else 0.0
+        }
+    
+    def clear_cache(self):
+        """Clear the summary cache"""
+        self._summary_cache.clear()
+        self._cache_hits = 0
+        self._cache_misses = 0
     
     async def summarize_turn(self, role: str, content: str, turn_index: int) -> TurnSummary:
         """Summarize a single turn with caching"""
         original_tokens = TokenCounter.count(content)
         content_hash = self._content_hash(content)
         
-        # Check if small enough to skip
+        # Check if small enough to skip (no need to cache these)
         if original_tokens <= self.max_output_tokens:
             return TurnSummary(
                 turn_index=turn_index,
@@ -315,8 +357,22 @@ class Level1Summarizer:
             )
         
         # Try cache first
-        cache_key = (content_hash, role)
-        # Note: In production, use Redis or similar for distributed caching
+        cached = self._get_cached_summary(content_hash, role)
+        if cached is not None:
+            self._cache_hits += 1
+            # Return cached result with correct turn_index
+            return TurnSummary(
+                turn_index=turn_index,
+                role=cached.role,
+                original_content=cached.original_content,
+                summary=cached.summary,
+                original_tokens=cached.original_tokens,
+                summary_tokens=cached.summary_tokens,
+                timestamp=cached.timestamp,
+                cache_hit=True
+            )
+        
+        self._cache_misses += 1
         
         async with self.semaphore:  # Limit concurrent calls
             try:
@@ -335,7 +391,7 @@ class Level1Summarizer:
                 
                 summary_tokens = TokenCounter.count(summary)
                 
-                return TurnSummary(
+                result = TurnSummary(
                     turn_index=turn_index,
                     role=role,
                     original_content=content,
@@ -345,6 +401,11 @@ class Level1Summarizer:
                     timestamp=datetime.now().isoformat(),
                     cache_hit=False
                 )
+                
+                # Cache the result for future use
+                self._cache_summary(content_hash, role, result)
+                
+                return result
                 
             except Exception as e:
                 return self._fallback_summary(role, content, turn_index, original_tokens, str(e))
@@ -714,6 +775,8 @@ class ContextCompactor:
             processing_time = (time.time() - start_time) * 1000
             savings = original_tokens - level1_tokens
             
+            cache_stats = self.level1.get_cache_stats()
+            
             return CompactionResult(
                 original_text=original_text,
                 compacted_text=level1_text,
@@ -724,7 +787,12 @@ class ContextCompactor:
                 processing_time_ms=processing_time,
                 token_savings=savings,
                 savings_percentage=(savings / original_tokens * 100) if original_tokens > 0 else 0,
-                metadata={"agent_id": agent_id, "stopped_at": "level1"}
+                metadata={
+                    "agent_id": agent_id,
+                    "stopped_at": "level1",
+                    "cache_stats": cache_stats,
+                    "cache_hit_rate": f"{cache_stats['hit_rate']:.1%}"
+                }
             )
         
         # Level 2: Batch synthesis
@@ -744,6 +812,8 @@ class ContextCompactor:
             processing_time = (time.time() - start_time) * 1000
             savings = original_tokens - level2_tokens
             
+            cache_stats = self.level1.get_cache_stats()
+            
             return CompactionResult(
                 original_text=original_text,
                 compacted_text=level2_text,
@@ -754,7 +824,12 @@ class ContextCompactor:
                 processing_time_ms=processing_time,
                 token_savings=savings,
                 savings_percentage=(savings / original_tokens * 100) if original_tokens > 0 else 0,
-                metadata={"agent_id": agent_id, "stopped_at": "level2"}
+                metadata={
+                    "agent_id": agent_id,
+                    "stopped_at": "level2",
+                    "cache_stats": cache_stats,
+                    "cache_hit_rate": f"{cache_stats['hit_rate']:.1%}"
+                }
             )
         
         # Level 3: Claude fallback
@@ -773,6 +848,8 @@ class ContextCompactor:
         processing_time = (time.time() - start_time) * 1000
         savings = original_tokens - level3_tokens
         
+        cache_stats = self.level1.get_cache_stats()
+        
         return CompactionResult(
             original_text=original_text,
             compacted_text=level3_text,
@@ -783,7 +860,12 @@ class ContextCompactor:
             processing_time_ms=processing_time,
             token_savings=savings,
             savings_percentage=(savings / original_tokens * 100) if original_tokens > 0 else 0,
-            metadata={"agent_id": agent_id, "stopped_at": "level3"}
+            metadata={
+                "agent_id": agent_id,
+                "stopped_at": "level3",
+                "cache_stats": cache_stats,
+                "cache_hit_rate": f"{cache_stats['hit_rate']:.1%}"
+            }
         )
     
     async def prerank_for_rag(self, query: str, documents: List[str], top_k: int = 5) -> List[int]:
