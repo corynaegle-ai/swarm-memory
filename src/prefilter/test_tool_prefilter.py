@@ -1,12 +1,17 @@
+import asyncio
+import time
 import unittest
 from unittest.mock import Mock, patch
 from tool_prefilter import (
     ToolSummarizer,
+    AsyncToolSummarizer,
     ToolRegistry,
     ToolConfig,
     SummaryFormatter,
     MetricsTracker,
     SummaryResult,
+    TokenEstimator,
+    RateLimiter,
     DEFAULT_OLLAMA_ENDPOINT
 )
 
@@ -43,9 +48,11 @@ class TestToolRegistry(unittest.TestCase):
     
     def test_token_estimation(self):
         registry = ToolRegistry()
-        # 1 token ≈ 4 chars
+        # New estimator uses better ratio for code/text
+        # "x" repeated is detected as text (0.30 ratio)
         text = "x" * 400
-        self.assertEqual(registry._estimate_tokens(text), 100)
+        expected = int(400 * 0.30)  # 120 tokens for text
+        self.assertEqual(registry._estimate_tokens(text), expected)
     
     def test_register_new_tool(self):
         registry = ToolRegistry()
@@ -268,6 +275,149 @@ class TestIntegration(unittest.TestCase):
         self.assertTrue(result.was_summarized)
 
 
+class TestInputValidation(unittest.TestCase):
+    """Test input validation"""
+    
+    def test_invalid_tool_name_type(self):
+        """Should raise TypeError for non-string tool_name"""
+        summarizer = ToolSummarizer()
+        with self.assertRaises(TypeError):
+            summarizer.summarize(123, "output")
+    
+    def test_empty_tool_name(self):
+        """Should raise ValueError for empty tool_name"""
+        summarizer = ToolSummarizer()
+        with self.assertRaises(ValueError):
+            summarizer.summarize("", "output")
+    
+    def test_whitespace_tool_name(self):
+        """Should raise ValueError for whitespace-only tool_name"""
+        summarizer = ToolSummarizer()
+        with self.assertRaises(ValueError):
+            summarizer.summarize("   ", "output")
+    
+    def test_none_output(self):
+        """Should raise ValueError for None output"""
+        summarizer = ToolSummarizer()
+        with self.assertRaises(ValueError):
+            summarizer.summarize("file_read", None)
+    
+    def test_non_string_output_converted(self):
+        """Should convert non-string output to string"""
+        summarizer = ToolSummarizer()
+        # Small output below threshold
+        result = summarizer.summarize("file_read", 12345)
+        self.assertEqual(result.summary, "12345")
+    
+    def test_invalid_context_type(self):
+        """Should raise TypeError for invalid context"""
+        summarizer = ToolSummarizer()
+        with self.assertRaises(TypeError):
+            summarizer.summarize("file_read", "output", context="invalid")
+
+
+class TestTokenEstimator(unittest.TestCase):
+    """Test the improved token estimator"""
+    
+    def test_empty_text(self):
+        """Empty text should return 0"""
+        self.assertEqual(TokenEstimator.estimate(""), 0)
+    
+    def test_text_ratio(self):
+        """Text should use TEXT_RATIO (0.30)"""
+        text = "This is just regular prose text without code indicators " * 10
+        expected = int(len(text) * TokenEstimator.TEXT_RATIO)
+        self.assertEqual(TokenEstimator.estimate(text), expected)
+    
+    def test_code_ratio(self):
+        """Code should use CODE_RATIO (0.25)"""
+        code = """
+import os
+import sys
+
+def main():
+    x = 1 + 2
+    y = x * 3
+    return y
+"""
+        result = TokenEstimator.estimate(code)
+        # Code has high density of code indicators
+        expected = int(len(code) * TokenEstimator.CODE_RATIO)
+        self.assertEqual(result, expected)
+    
+    def test_mixed_content(self):
+        """Mixed content should be detected appropriately"""
+        # Mostly text with some code
+        mixed = "This is text. " * 50 + "def function(): pass"
+        result = TokenEstimator.estimate(mixed)
+        self.assertGreater(result, 0)
+
+
+class TestRateLimiter(unittest.TestCase):
+    """Test rate limiting"""
+    
+    def test_rate_limiter_allows_first_calls(self):
+        """First calls within limit should not block"""
+        limiter = RateLimiter(calls_per_minute=10)
+        # First call should not raise or block significantly
+        start = time.time()
+        limiter.acquire()
+        elapsed = time.time() - start
+        self.assertLess(elapsed, 0.1)  # Should be nearly instant
+    
+    def test_rate_limiter_enforces_interval(self):
+        """Should enforce minimum interval between calls"""
+        limiter = RateLimiter(calls_per_minute=60)  # 1 per second
+        limiter.acquire()
+        start = time.time()
+        limiter.acquire()  # Second call should wait
+        elapsed = time.time() - start
+        self.assertGreaterEqual(elapsed, 0.9)  # Should wait ~1 second
+
+
+class TestAsyncToolSummarizer(unittest.TestCase):
+    """Test async functionality"""
+    
+    @patch('tool_prefilter.aiohttp.ClientSession.post')
+    async def test_async_summarize(self, mock_post):
+        """Test async summarization"""
+        # Mock the async response
+        mock_response = Mock()
+        mock_response.status = 200
+        mock_response.json = Mock(return_value=asyncio.Future())
+        mock_response.json.return_value.set_result({"response": "Async summary"})
+        mock_post.return_value.__aenter__ = Mock(return_value=asyncio.Future())
+        mock_post.return_value.__aenter__.return_value.set_result(mock_response)
+        mock_post.return_value.__aexit__ = Mock(return_value=asyncio.Future())
+        mock_post.return_value.__aexit__.return_value.set_result(False)
+        
+        summarizer = AsyncToolSummarizer()
+        
+        # Large output that needs summarization
+        output = "x" * 5000
+        result = await summarizer.summarize("file_read", output)
+        
+        self.assertTrue(result.was_summarized)
+        self.assertIn("Async summary", result.summary)
+        
+        await summarizer.close()
+    
+    def test_async_input_validation(self):
+        """Async summarizer should also validate inputs"""
+        async def test_validation():
+            summarizer = AsyncToolSummarizer()
+            
+            with self.assertRaises(TypeError):
+                await summarizer.summarize(123, "output")
+            
+            with self.assertRaises(ValueError):
+                await summarizer.summarize("file_read", None)
+            
+            await summarizer.close()
+        
+        asyncio.run(test_validation())
+
+
 class TestEdgeCases(unittest.TestCase):
     
     def test_empty_output(self):
@@ -303,8 +453,9 @@ class TestEdgeCases(unittest.TestCase):
     def test_preserves_exact_threshold(self):
         """Output exactly at threshold should be summarized"""
         registry = ToolRegistry()
-        # file_read threshold is 1000 tokens = 4000 chars
-        exact_output = "x" * 4000
+        # file_read threshold is 1000 tokens
+        # With new estimator, 1000 tokens ≈ 3333 chars of text
+        exact_output = "x" * 3334  # Slightly over to ensure it triggers
         self.assertTrue(registry.should_summarize("file_read", exact_output))
 
 

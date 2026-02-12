@@ -4,20 +4,27 @@ Summarizes large tool outputs before sending to Claude.
 Reduces token usage by 80% for tool results.
 """
 
+import asyncio
 import json
 import os
 import re
-from typing import Dict, List, Optional, Tuple, Any
+import time
+from typing import Dict, List, Optional, Tuple, Any, Union
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
+from functools import wraps
+import aiohttp
 import requests
 
 
 # Configuration constants
-DEFAULT_OLLAMA_ENDPOINT = "http://192.168.85.158:11434"
-DEFAULT_SUMMARY_MODEL = "qwen2.5-coder:7b"
+DEFAULT_OLLAMA_ENDPOINT = os.getenv("OLLAMA_ENDPOINT", "http://192.168.85.158:11434")
+DEFAULT_SUMMARY_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
 SUMMARY_MAX_TOKENS = 200
 OLLAMA_TIMEOUT = 30
+MAX_INPUT_CHARS = 8000  # ~2000 tokens, prevents overly large prompts
+MAX_PRESERVED_ITEMS = 20
+RATE_LIMIT_CALLS_PER_MINUTE = 60  # Ollama rate limit protection
 
 
 @dataclass
@@ -148,8 +155,11 @@ class ToolRegistry:
     
     @staticmethod
     def _estimate_tokens(text: str) -> int:
-        """Rough token estimation (1 token ≈ 4 chars for English)"""
-        return len(text) // 4
+        """
+        Estimate tokens using improved estimator.
+        Uses different ratios for code vs text.
+        """
+        return TokenEstimator.estimate(text)
 
 
 class SummaryFormatter:
@@ -260,6 +270,30 @@ class MetricsTracker:
             print(f"  {tool}: {tool_stats['calls']} calls, {rate:.1%} summarized, {tool_stats['tokens_saved']:,} tokens saved")
 
 
+def validate_input(func):
+    """Decorator to validate inputs to summarize methods"""
+    @wraps(func)
+    def wrapper(self, tool_name: str, output: str, context: Optional[Dict] = None, *args, **kwargs):
+        # Validate tool_name
+        if not isinstance(tool_name, str):
+            raise TypeError(f"tool_name must be a string, got {type(tool_name)}")
+        if not tool_name.strip():
+            raise ValueError("tool_name cannot be empty")
+        
+        # Validate output
+        if output is None:
+            raise ValueError("output cannot be None")
+        if not isinstance(output, str):
+            output = str(output)
+        
+        # Validate context
+        if context is not None and not isinstance(context, dict):
+            raise TypeError(f"context must be a dict or None, got {type(context)}")
+        
+        return func(self, tool_name, output, context, *args, **kwargs)
+    return wrapper
+
+
 class ToolSummarizer:
     """
     Main interface for tool result pre-filtering.
@@ -268,13 +302,16 @@ class ToolSummarizer:
     
     def __init__(self,
                  ollama_endpoint: str = DEFAULT_OLLAMA_ENDPOINT,
-                 model: str = DEFAULT_SUMMARY_MODEL):
+                 model: str = DEFAULT_SUMMARY_MODEL,
+                 rate_limit_calls_per_minute: int = RATE_LIMIT_CALLS_PER_MINUTE):
         self.ollama_endpoint = ollama_endpoint
         self.model = model
         self.registry = ToolRegistry()
         self.formatter = SummaryFormatter()
         self.metrics = MetricsTracker()
+        self.rate_limiter = RateLimiter(rate_limit_calls_per_minute)
     
+    @validate_input
     def summarize(self, 
                   tool_name: str, 
                   output: str,
@@ -377,7 +414,7 @@ class ToolSummarizer:
                     preserved.append(line.strip())
                     break
         
-        return preserved[:20]  # Limit preserved items
+        return preserved[:MAX_PRESERVED_ITEMS]
     
     def _generate_summary(self, 
                          output: str, 
@@ -385,10 +422,12 @@ class ToolSummarizer:
                          context: Dict) -> str:
         """Generate summary using local 7B model"""
         
+        # Apply rate limiting
+        self.rate_limiter.acquire()
+        
         # Truncate very long outputs for the prompt
-        max_input_chars = 8000  # ~2000 tokens
-        if len(output) > max_input_chars:
-            output = output[:max_input_chars] + "\n... [truncated for summary]"
+        if len(output) > MAX_INPUT_CHARS:
+            output = output[:MAX_INPUT_CHARS] + "\n... [truncated for summary]"
         
         # Build prompt
         prompt = f"""You are a tool output summarizer. Create a concise summary of the following tool output.
@@ -442,6 +481,282 @@ Summary:"""
         self.metrics.print_report()
 
 
+class AsyncToolSummarizer(ToolSummarizer):
+    """
+    Async version of ToolSummarizer for non-blocking operation.
+    Uses aiohttp for async HTTP calls to Ollama.
+    """
+    
+    def __init__(self,
+                 ollama_endpoint: str = DEFAULT_OLLAMA_ENDPOINT,
+                 model: str = DEFAULT_SUMMARY_MODEL,
+                 rate_limit_calls_per_minute: int = RATE_LIMIT_CALLS_PER_MINUTE):
+        super().__init__(ollama_endpoint, model, rate_limit_calls_per_minute)
+        self._session: Optional[aiohttp.ClientSession] = None
+    
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Get or create aiohttp session"""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+    
+    async def close(self):
+        """Close the aiohttp session"""
+        if self._session and not self._session.closed:
+            await self._session.close()
+    
+    async def summarize(self, 
+                       tool_name: str, 
+                       output: str,
+                       context: Optional[Dict] = None) -> SummaryResult:
+        """
+        Async version of summarize.
+        Non-blocking tool output summarization.
+        """
+        import time
+        start_time = time.time()
+        
+        # Validate inputs (reuse sync validation)
+        if not isinstance(tool_name, str):
+            raise TypeError(f"tool_name must be a string, got {type(tool_name)}")
+        if not tool_name.strip():
+            raise ValueError("tool_name cannot be empty")
+        if output is None:
+            raise ValueError("output cannot be None")
+        if not isinstance(output, str):
+            output = str(output)
+        if context is not None and not isinstance(context, dict):
+            raise TypeError(f"context must be a dict or None, got {type(context)}")
+        
+        original_tokens = TokenEstimator.estimate(output)
+        context = context or {}
+        
+        # Check if we should summarize
+        config = self.registry.get_config(tool_name)
+        if not config or not self.registry.should_summarize(tool_name, output):
+            processing_time = (time.time() - start_time) * 1000
+            self.metrics.record(tool_name, original_tokens, original_tokens, False, processing_time)
+            
+            return SummaryResult(
+                original_output=output,
+                summary=output,
+                was_summarized=False,
+                original_tokens=original_tokens,
+                summary_tokens=original_tokens,
+                tool_name=tool_name,
+                processing_time_ms=processing_time,
+                metadata={"reason": "Below threshold"}
+            )
+        
+        # Extract preserved items
+        preserved_items = self._extract_preserved_items(output, config.preserve_patterns)
+        
+        # Generate summary
+        try:
+            summary = await self._generate_summary_async(output, config, context)
+            summary_tokens = TokenEstimator.estimate(summary)
+            
+            formatted_summary = self.formatter.format_summary(
+                tool_name, summary, {
+                    "original_tokens": original_tokens,
+                    "summary_tokens": summary_tokens,
+                    "preserved_items": preserved_items
+                }
+            )
+            
+            processing_time = (time.time() - start_time) * 1000
+            self.metrics.record(tool_name, original_tokens, summary_tokens, True, processing_time)
+            
+            return SummaryResult(
+                original_output=output,
+                summary=formatted_summary,
+                was_summarized=True,
+                original_tokens=original_tokens,
+                summary_tokens=summary_tokens,
+                tool_name=tool_name,
+                processing_time_ms=processing_time,
+                metadata={
+                    "preserved_items": preserved_items,
+                    "focus": config.summary_focus,
+                    "async": True
+                }
+            )
+            
+        except Exception as e:
+            processing_time = (time.time() - start_time) * 1000
+            error_summary = self.formatter.format_error(tool_name, str(e), output)
+            
+            self.metrics.record(tool_name, original_tokens, original_tokens, False, processing_time)
+            
+            return SummaryResult(
+                original_output=output,
+                summary=error_summary,
+                was_summarized=False,
+                original_tokens=original_tokens,
+                summary_tokens=original_tokens,
+                tool_name=tool_name,
+                processing_time_ms=processing_time,
+                metadata={"error": str(e), "async": True}
+            )
+    
+    async def _generate_summary_async(self, 
+                                     output: str, 
+                                     config: ToolConfig,
+                                     context: Dict) -> str:
+        """Generate summary asynchronously using aiohttp"""
+        
+        # Apply async rate limiting
+        await self.rate_limiter.acquire_async()
+        
+        # Truncate very long outputs
+        if len(output) > MAX_INPUT_CHARS:
+            output = output[:MAX_INPUT_CHARS] + "\n... [truncated for summary]"
+        
+        prompt = f"""You are a tool output summarizer. Create a concise summary of the following tool output.
+
+Tool: {config.name}
+Context: {json.dumps(context)}
+Focus on: {config.summary_focus}
+
+Output to summarize:
+```
+{output}
+```
+
+Provide a brief summary (max 150 words) highlighting:
+1. Key findings or results
+2. Important files/locations mentioned
+3. Any errors or warnings
+4. Overall structure or pattern
+
+Summary:"""
+        
+        session = await self._get_session()
+        
+        async with session.post(
+            f"{self.ollama_endpoint}/api/generate",
+            json={
+                "model": self.model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.3,
+                    "num_predict": config.max_summary_tokens
+                }
+            },
+            timeout=aiohttp.ClientTimeout(total=OLLAMA_TIMEOUT)
+        ) as response:
+            if response.status != 200:
+                raise Exception(f"Ollama error: {response.status}")
+            
+            result = await response.json()
+            return result.get("response", "").strip()
+
+
+class TokenEstimator:
+    """
+    Better token estimation for code and text.
+    Uses a hybrid approach that's more accurate than simple char count.
+    """
+    
+    # Average tokens per character by content type
+    CODE_RATIO = 0.25  # Code: ~4 chars per token
+    TEXT_RATIO = 0.30  # Prose: ~3.3 chars per token
+    
+    @classmethod
+    def estimate(cls, text: str) -> int:
+        """
+        Estimate tokens more accurately.
+        Uses different ratios for code-heavy vs text-heavy content.
+        """
+        if not text:
+            return 0
+        
+        # Detect code-heavy content
+        code_indicators = [
+            r'[{};]',  # Braces and semicolons
+            r'^(import|from|def|class|function|const|let|var|#include)',
+            r'[=+\-*/<>!]+',  # Operators
+        ]
+        
+        code_score = 0
+        for indicator in code_indicators:
+            code_score += len(re.findall(indicator, text, re.MULTILINE))
+        
+        # Calculate ratio based on code density
+        code_density = code_score / max(len(text) / 100, 1)
+        if code_density > 0.5:
+            ratio = cls.CODE_RATIO
+        else:
+            ratio = cls.TEXT_RATIO
+        
+        return int(len(text) * ratio)
+
+
+class RateLimiter:
+    """
+    Simple rate limiter for Ollama API calls.
+    Prevents overwhelming the local model.
+    """
+    
+    def __init__(self, calls_per_minute: int = RATE_LIMIT_CALLS_PER_MINUTE):
+        self.calls_per_minute = calls_per_minute
+        self.min_interval = 60.0 / calls_per_minute
+        self.last_call_time = 0
+        self.call_count = 0
+        self.window_start = time.time()
+    
+    def acquire(self):
+        """
+        Acquire permission to make a call.
+        Blocks if rate limit would be exceeded.
+        """
+        now = time.time()
+        
+        # Reset window if minute has passed
+        if now - self.window_start >= 60:
+            self.call_count = 0
+            self.window_start = now
+        
+        # Check if we're at the limit
+        if self.call_count >= self.calls_per_minute:
+            sleep_time = 60 - (now - self.window_start)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            self.call_count = 0
+            self.window_start = time.time()
+        
+        # Ensure minimum interval between calls
+        time_since_last = now - self.last_call_time
+        if time_since_last < self.min_interval:
+            time.sleep(self.min_interval - time_since_last)
+        
+        self.last_call_time = time.time()
+        self.call_count += 1
+    
+    async def acquire_async(self):
+        """Async version of acquire"""
+        now = time.time()
+        
+        if now - self.window_start >= 60:
+            self.call_count = 0
+            self.window_start = now
+        
+        if self.call_count >= self.calls_per_minute:
+            sleep_time = 60 - (now - self.window_start)
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
+            self.call_count = 0
+            self.window_start = time.time()
+        
+        time_since_last = now - self.last_call_time
+        if time_since_last < self.min_interval:
+            await asyncio.sleep(self.min_interval - time_since_last)
+        
+        self.last_call_time = time.time()
+        self.call_count += 1
+
+
 # Convenience function for quick use
 def summarize_tool_output(
     tool_name: str,
@@ -455,4 +770,18 @@ def summarize_tool_output(
     """
     summarizer = ToolSummarizer(ollama_endpoint=ollama_endpoint)
     result = summarizer.summarize(tool_name, output, context)
+    return result.summary
+
+
+async def summarize_tool_output_async(
+    tool_name: str,
+    output: str,
+    ollama_endpoint: str = DEFAULT_OLLAMA_ENDPOINT,
+    context: Optional[Dict] = None
+) -> str:
+    """
+    Async version of summarize_tool_output.
+    """
+    summarizer = AsyncToolSummarizer(ollama_endpoint=ollama_endpoint)
+    result = await summarizer.summarize(tool_name, output, context)
     return result.summary
